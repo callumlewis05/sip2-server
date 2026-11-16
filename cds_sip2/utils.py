@@ -2,7 +2,7 @@
 
 from datetime import date, datetime, time
 
-DEFAULT_SIP2_DATE_FORMAT = "%Y%m%d    %H%M%S"
+SIP2_DATE_FORMAT = "%Y%m%d    %H%M%S"
 """SIP2 18-char date: YYYYMMDDZZZZHHMMSS, with ZZZZ = four blanks (local time)."""
 
 
@@ -29,8 +29,6 @@ def parse_iso(value):
     if isinstance(value, date):
         return datetime.combine(value, time(23, 59, 59))
     text = str(value).strip()
-    if text.endswith("Z"):  # Python < 3.11 fromisoformat does not accept Z
-        text = text[:-1] + "+00:00"
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
@@ -40,20 +38,15 @@ def parse_iso(value):
     return parsed
 
 
-def to_sip2_date(value, fmt=None):
+def to_sip2_date(value):
     """Format ``value`` as a SIP2 date, or return ``None`` when it cannot be parsed."""
     parsed = parse_iso(value)
     if parsed is None:
         return None
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone().replace(tzinfo=None)
-    return parsed.strftime(fmt or _configured_date_format())
+    return parsed.strftime(SIP2_DATE_FORMAT)
 
 
-def _configured_date_format():
-    try:
-        from flask import current_app
-
-        return current_app.config.get("SIP2_CIRCULATION_DATE_FORMAT") or DEFAULT_SIP2_DATE_FORMAT
-    except RuntimeError:  # outside an application context
-        return DEFAULT_SIP2_DATE_FORMAT
+def sip2_now():
+    return datetime.now().strftime(SIP2_DATE_FORMAT)

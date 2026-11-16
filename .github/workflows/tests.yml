@@ -50,19 +50,8 @@ jobs:
       matrix:
         python-version: [3.14]
 
-    services:
-      redis:
-        image: redis:7-alpine
-        ports: ["6379:6379"]
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-
     env:
       EXTRAS: tests
-      SIP2_TEST_REDIS_URL: redis://localhost:6379/9
 
     steps:
       - name: Checkout
@@ -81,14 +70,13 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          # editable install registers the entry points
           pip install -e ".[$EXTRAS]"
           pip freeze
 
       - name: Run unit tests
         run: pytest tests/unit --cov=cds_sip2 --cov-report=term-missing
 
-      - name: Run integration tests (real socket server + Redis + fake ILS)
+      - name: Run integration tests (real server subprocess + fake ILS)
         run: pytest tests/integration -m integration -s
 
   Docker:
@@ -113,5 +101,6 @@ jobs:
 
       - name: Smoke test the image
         run: |
-          docker run --rm cds-sip2:ci python -c "import cds_sip2, invenio_sip2; print(cds_sip2.__version__)"
-          docker run --rm cds-sip2:ci invenio selfcheck --help
+          docker run --rm cds-sip2:ci python -c "import cds_sip2.__main__, cds_sip2; print(cds_sip2.__version__)"
+          # Settings validation runs before anything binds: a bad value must exit 2.
+          docker run --rm -e CDS_SIP2_PORT=nope cds-sip2:ci && exit 1 || test $? -eq 2

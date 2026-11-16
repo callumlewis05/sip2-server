@@ -1,17 +1,14 @@
-# Local development stack: Redis + fake ILS + the sidecar (plaintext, no stunnel).
+# Local development stack: fake ILS + the SIP2 server (plaintext, no stunnel).
 #
 #   docker compose up --build
 #   python -m tests.sip2_client --port 3004 --terminal kiosk1 --password secret \
-#       --patron P001 --pin 1234 --item IT001
+#       --patron P001 --pin 1234 --item CM-B000456412
 #
 services:
-  redis:
-    image: redis:7-alpine
-    ports: ["6380:6379"]
-
   fake-ils:
-    build: .
-    command: ["python", "-m", "tests.fake_ils", "--host", "0.0.0.0", "--port", "5001"]
+    # The fake needs Flask, which the server image deliberately does not ship.
+    image: python:3.14-slim-bookworm
+    command: ["sh", "-c", "pip install -q flask && python -m tests.fake_ils --host 0.0.0.0 --port 5001"]
     working_dir: /app
     volumes:
       - .:/app:ro
@@ -19,14 +16,13 @@ services:
 
   sip2:
     build: .
-    depends_on: [redis, fake-ils]
+    depends_on: [fake-ils]
     environment:
-      SIP2_BIND_HOST: 0.0.0.0           # only for local use; the pod binds 127.0.0.1
-      SIP2_DATASTORE_REDIS_URL: redis://redis:6379/0
+      CDS_SIP2_BIND_HOST: 0.0.0.0       # only for local use; the pod binds 127.0.0.1
       CDS_SIP2_ILS_URL: http://fake-ils:5001/api/sip2
       CDS_SIP2_ILS_TOKEN: test-token
-      SECRET_KEY: dev
-    ports: ["3004:3004"]
+      CDS_SIP2_LOG_HASH_KEY: dev
+    ports: ["3004:3004", "8080:8080"]
     healthcheck:
       test: ["CMD", "/usr/local/bin/entrypoint.sh", "healthcheck"]
       interval: 15s

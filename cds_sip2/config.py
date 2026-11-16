@@ -1,135 +1,127 @@
-"""Configuration for the CDS SIP2 sidecar.
+"""Settings for the CDS SIP2 server.
 
-Everything secret or deployment-specific comes from the environment; the
-structural parts (handler wiring, protocol flags) live here.  Any Invenio
-config value can additionally be overridden with an ``INVENIO_``-prefixed
-environment variable, e.g. ``INVENIO_SIP2_TIMEOUT_PERIOD=20``.
+Read once from the environment by :meth:`Settings.from_env` in the
+composition root and passed down explicitly; nothing else reads
+``os.environ``. The object is frozen, so a value cannot change while the
+server is running.
 """
 
 import os
+from dataclasses import dataclass, field, fields
+from types import MappingProxyType
 
-
-def _env(name, default=None):
-    return os.environ.get(name, default)
-
-
-def _env_int(name, default):
-    value = os.environ.get(name)
-    return int(value) if value not in (None, "") else default
-
-
-def _env_float(name, default):
-    value = os.environ.get(name)
-    return float(value) if value not in (None, "") else default
-
-
-# ---------------------------------------------------------------------------
-# Sidecar -> ILS
-# ---------------------------------------------------------------------------
-
-CDS_SIP2_ILS_URL = _env("CDS_SIP2_ILS_URL", "http://localhost:5000/api/sip2")
-"""Base URL of the SIP2-facing REST endpoints on the ILS (no trailing slash)."""
-
-CDS_SIP2_ILS_TOKEN = _env("CDS_SIP2_ILS_TOKEN", "")
-"""Bearer token the ILS issues to this sidecar. Always set from a Secret."""
-
-CDS_SIP2_ILS_CONNECT_TIMEOUT = _env_float("CDS_SIP2_ILS_CONNECT_TIMEOUT", 3.0)
-CDS_SIP2_ILS_READ_TIMEOUT = _env_float("CDS_SIP2_ILS_READ_TIMEOUT", 8.0)
-"""HTTP timeouts. Keep connect + read well below SIP2_TIMEOUT_PERIOD, or the
-device gives up and re-sends while the ILS is still processing."""
-
-# Fallbacks used when the ILS login response does not provide them.
-CDS_SIP2_INSTITUTION_ID = _env("CDS_SIP2_INSTITUTION_ID", "CERN")
-CDS_SIP2_LIBRARY_NAME = _env("CDS_SIP2_LIBRARY_NAME", "CERN Library")
-CDS_SIP2_LANGUAGE = _env("CDS_SIP2_LANGUAGE", "en")
-
-CDS_SIP2_MESSAGES = {
-    "unavailable": "Service temporarily unavailable. Please ask at the library desk.",
-    "unknown_patron": "Card not recognised. Please ask at the library desk.",
-    "unknown_item": "Item not found.",
-    "refused": "Transaction refused. Please ask at the library desk.",
-}
-"""Screen messages (SIP2 field AF) shown on the device for sidecar-side failures.
-ILS-side rejections carry their own ``user_message``."""
-
-CDS_SIP2_MONITORING_TOKEN = _env("CDS_SIP2_MONITORING_TOKEN")
-"""Optional shared secret for invenio-sip2's monitoring REST views. Unset ->
-those views deny everything (the sidecar normally serves no HTTP at all)."""
-
-# ---------------------------------------------------------------------------
-# invenio-sip2
-# ---------------------------------------------------------------------------
-
-SIP2_REMOTE_ACTION_HANDLERS = {
-    # Key = remote app name, passed to `invenio selfcheck start ... -r ils`.
-    "ils": {
-        "login_handler": "cds_sip2.handlers:selfcheck_login",
-        "system_status_handler": "cds_sip2.handlers:system_status",
-        "patron_handlers": {
-            "validate_patron": "cds_sip2.handlers:validate_patron",
-            "authorize_patron": "cds_sip2.handlers:authorize_patron",
-            "enable_patron": "cds_sip2.handlers:enable_patron",
-            "patron_status": "cds_sip2.handlers:patron_status",
-            "account": "cds_sip2.handlers:patron_information",
-        },
-        "item_handlers": {
-            "item": "cds_sip2.handlers:item_information",
-        },
-        "circulation_handlers": {
-            "checkout": "cds_sip2.handlers:checkout",
-            "checkin": "cds_sip2.handlers:checkin",
-            "renew": "cds_sip2.handlers:renew",
-            # "hold" / "renew_all" deliberately absent: not advertised in 98/BX.
-        },
-        # "fee_paid_handler" deliberately absent.
+DEFAULT_MESSAGES = MappingProxyType(
+    {
+        "unavailable": "Service temporarily unavailable. Please ask at the library desk.",
+        "unknown_patron": "Card not recognised. Please ask at the library desk.",
+        "unknown_item": "Item not found.",
+        "refused": "Transaction refused. Please ask at the library desk.",
+        "ambiguous": "Could not confirm the transaction. Please check at the library desk.",
+        "not_logged_in": "Terminal not logged in. Please ask at the library desk.",
+        "unsupported": "This function is not available here. Please ask at the library desk.",
     }
-}
+)
+"""Screen messages (SIP2 field AF) for server-side outcomes. ILS refusals
+carry their own ``user_message``."""
 
-SIP2_DATASTORE_HANDLER = "invenio_sip2.datastore:Sip2RedisDatastore"
-SIP2_DATASTORE_REDIS_URL = _env("SIP2_DATASTORE_REDIS_URL", "redis://localhost:6379/0")
-SIP2_DATASTORE_REDIS_PREFIX = _env("SIP2_DATASTORE_REDIS_PREFIX", "cds_sip2")
 
-# Logging: every request/response frame is logged at INFO (that is the "simple
-# log interface"). Frames contain patron barcodes and the login action logs the
-# terminal password at DEBUG, so never run DEBUG in production.
-SIP2_LOGGING_CONSOLE = True
-SIP2_LOGGING_CONSOLE_LEVEL = _env("SIP2_LOGGING_CONSOLE_LEVEL", "INFO")
-# The Dockerfile sets CDS_SIP2_LOG_FILE=/var/log/sip2/sip2.log.
-SIP2_LOGGING_FS_LOGFILE = _env("CDS_SIP2_LOG_FILE") or None
-SIP2_LOGGING_FS_LEVEL = "INFO"
-SIP2_LOGGING_FS_MAXBYTES = 50 * 1024 * 1024
-SIP2_LOGGING_FS_BACKUPCOUNT = 5
+class ConfigError(ValueError):
+    """An environment variable is missing or has an unusable value."""
 
-# Capabilities advertised in the ACS Status (98) response.
-SIP2_SUPPORT_CHECKIN = True
-SIP2_SUPPORT_CHECKOUT = True
-SIP2_SUPPORT_RENEWAL_POLICY = True
-SIP2_SUPPORT_STATUS_UPDATE = False
-SIP2_SUPPORT_OFFLINE_STATUS = False
-SIP2_SUPPORT_ONLINE_STATUS = True
 
-SIP2_PROTOCOL = "2.00"
-SIP2_TEXT_ENCODING = "UTF-8"
-SIP2_LINE_TERMINATOR = "\r"
-SIP2_ERROR_DETECTION = True  # expect and emit AY<seq>AZ<checksum>
-SIP2_TIMEOUT_PERIOD = _env_int("SIP2_TIMEOUT_PERIOD", 15)
-SIP2_RETRIES_ALLOWED = _env_int("SIP2_RETRIES_ALLOWED", 3)
-SIP2_DEFAULT_LANGUAGE = CDS_SIP2_LANGUAGE
-BABEL_DEFAULT_LANGUAGE = CDS_SIP2_LANGUAGE
+@dataclass(frozen=True)
+class Settings:
+    # --- ILS (package ``ils``) ----------------------------------------------
+    ils_url: str = "http://localhost:5000/api/sip2"
+    ils_token: str = ""
+    ils_connect_timeout: float = 3.0
+    ils_read_timeout: float = 8.0
+    """Keep connect + read well below the kiosk's own timeout, or the kiosk
+    gives up and resends while the ILS is still processing."""
 
-SIP2_PERMISSIONS_FACTORY = "cds_sip2.permissions:permission_factory"
+    # --- SIP2 listener ------------------------------------------------------
+    bind_host: str = "127.0.0.1"
+    """Loopback: stunnel in the same pod is the only client."""
+    port: int = 3004
+    max_connections: int = 50
+    idle_timeout: float = 300.0
+    """Seconds without a complete frame before the connection is closed."""
+    max_frame_bytes: int = 4096
+    shutdown_grace: float = 10.0
+    """Seconds an in-flight request may take to finish after SIGTERM."""
 
-# ---------------------------------------------------------------------------
-# Inert defaults for Invenio extensions that arrive transitively (invenio-app,
-# invenio-access -> invenio-accounts -> invenio-db, ...). None of them is used
-# by the sidecar; these values only stop their init_app() from complaining or
-# from trying to reach services that do not exist in this pod.
-# ---------------------------------------------------------------------------
-SECRET_KEY = _env("SECRET_KEY", "dev-only-change-me")
-SQLALCHEMY_DATABASE_URI = _env("SQLALCHEMY_DATABASE_URI", "sqlite://")
-RATELIMIT_ENABLED = False
-RATELIMIT_STORAGE_URI = "memory://"
-RATELIMIT_STORAGE_URL = "memory://"  # older Flask-Limiter name
-CACHE_TYPE = "NullCache"
-ACCOUNTS_SESSION_REDIS_URL = SIP2_DATASTORE_REDIS_URL
-APP_ALLOWED_HOSTS = None
+    # --- SIP2 protocol ------------------------------------------------------
+    error_detection: bool = True
+    """Verify AZ on requests and emit AY/AZ on every response."""
+    encoding: str = "utf-8"
+    timeout_period: int = 15
+    """Advertised verbatim in the 98 response (3 digits)."""
+    retries_allowed: int = 3
+    max_login_attempts: int = 3
+    """Failed 93s on one connection before it is closed."""
+
+    # --- Fallbacks when the ILS login response omits them -------------------
+    institution_id: str = "CERN"
+    library_name: str = "CERN Library"
+    language: str = "en"
+
+    # --- Health -------------------------------------------------------------
+    health_host: str = "0.0.0.0"
+    """The probes come from the kubelet, so this one is not loopback."""
+    health_port: int = 8080
+    health_ils_cache: float = 10.0
+    """Seconds a readiness probe reuses the last ILS ping result."""
+
+    # --- Logging ------------------------------------------------------------
+    log_level: str = "INFO"
+    log_hash_key: str = ""
+    """Key for pseudonymising patron barcodes in logs. Set it from a Secret so
+    entries stay correlatable across restarts; empty -> random per process."""
+
+    messages: MappingProxyType = field(default=DEFAULT_MESSAGES)
+
+    @classmethod
+    def from_env(cls, environ=None):
+        """Build settings from ``CDS_SIP2_*`` variables (see the README)."""
+        env = os.environ if environ is None else environ
+        values = {}
+        for spec in fields(cls):
+            if spec.name == "messages":
+                continue
+            name = f"CDS_SIP2_{spec.name.upper()}"
+            raw = env.get(name)
+            if raw is None or raw == "":
+                continue
+            values[spec.name] = _coerce(name, raw, type(spec.default))
+        settings = cls(**values)
+        settings.validate()
+        return settings
+
+    def validate(self):
+        if self.max_connections < 1:
+            raise ConfigError("CDS_SIP2_MAX_CONNECTIONS must be at least 1")
+        if self.max_frame_bytes < 64:
+            raise ConfigError("CDS_SIP2_MAX_FRAME_BYTES must be at least 64")
+        if not 0 <= self.timeout_period <= 999 or not 0 <= self.retries_allowed <= 999:
+            raise ConfigError("CDS_SIP2_TIMEOUT_PERIOD and _RETRIES_ALLOWED must fit 3 digits")
+        try:
+            "".encode(self.encoding)
+        except LookupError as exc:
+            raise ConfigError(f"CDS_SIP2_ENCODING: unknown encoding {self.encoding!r}") from exc
+
+    def message(self, key):
+        return self.messages.get(key) or self.messages["refused"]
+
+
+def _coerce(name, raw, kind):
+    if kind is bool:
+        lowered = raw.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+        raise ConfigError(f"{name}: expected a boolean, got {raw!r}")
+    try:
+        return kind(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name}: expected {kind.__name__}, got {raw!r}") from exc
