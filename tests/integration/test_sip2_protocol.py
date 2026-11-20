@@ -27,6 +27,7 @@ pytestmark = pytest.mark.integration
 
 ROOT = Path(__file__).resolve().parents[2]
 TERMINAL, PASSWORD = "kiosk1", "secret"
+TERMINALS = {TERMINAL: {"password": PASSWORD, "user_pid": "42"}}
 PATRON, PIN, ITEM, TITLE = "P001", "1234", "CM-B000456412", "Écoute"
 
 
@@ -65,6 +66,7 @@ def sip2_server(ils_server, tmp_path_factory):
         **os.environ,
         "CDS_SIP2_ILS_URL": ils_server.base_url,
         "CDS_SIP2_ILS_TOKEN": fake_ils.TOKEN,
+        "CDS_SIP2_TERMINALS": json.dumps(TERMINALS),
         "CDS_SIP2_PORT": str(port),
         "CDS_SIP2_HEALTH_HOST": "127.0.0.1",
         "CDS_SIP2_HEALTH_PORT": str(health_port),
@@ -122,28 +124,20 @@ def test_acs_status_advertises_configured_capabilities(conn):
     assert status.fixed["online_status"] == "Y"
     assert status.fixed["checkin_ok"] == "Y"
     assert status.fixed["checkout_ok"] == "Y"
-    assert status.fixed["acs_renewal_policy"] == "Y"
+    assert status.fixed["acs_renewal_policy"] == "N"
     assert status.fixed["status_update_ok"] == "N"
     assert status.fixed["offline_ok"] == "N"
     assert status.fixed["protocol_version"] == "2.00"
     assert status.get("AO") == "CERN"
     assert status.get("AM") == "CERN Library"
-    assert status.get("BX") == "YYYNYYYYYNYNYNYN"
+    assert status.fixed["timeout_period"] == "150"
+    assert status.get("BX") == "NYYNYYYNNNYYNNNN"
 
 
-def test_full_selfcheck_session(conn):
+def test_full_inventory_session(conn):
     _login(conn)
     status = conn.send(sip2.sc_status())
     institution = status.get("AO", "")
-
-    # 63 -> 64: patron with two existing loans and a correct PIN.
-    patron = conn.send(sip2.patron_information(PATRON, institution, pin=PIN))
-    assert patron.code == "64", patron
-    assert patron.get("AA") == PATRON
-    assert patron.get("AE") == "Ada Lovelace"
-    assert patron.get("BL") == "Y"
-    assert patron.get("CQ") == "Y"
-    assert int(patron.fixed["charged_items_count"]) == 2
 
     # 17 -> 18: available item.
     item = conn.send(sip2.item_information(ITEM, institution))
@@ -151,6 +145,13 @@ def test_full_selfcheck_session(conn):
     assert item.fixed["circulation_status"] == "03"  # available
     assert item.get("AB") == ITEM
     assert item.get("AJ") == TITLE
+    assert item.get("CK") == "001"  # media type from the ILS record
+
+    # 19 -> 20: the wand reports the item as seen.
+    seen = conn.send(sip2.item_status_update(ITEM, "shelf-3", institution))
+    assert seen.code == "20", seen
+    assert seen.fixed["item_properties_ok"] == "1"
+    assert conn.send(sip2.item_information(ITEM, institution)).get("AF") == "Seen: shelf-3"
 
     # 11 -> 12: checkout succeeds, due date present.
     checkout = conn.send(sip2.checkout(PATRON, ITEM, institution, pin=PIN))
@@ -171,11 +172,6 @@ def test_full_selfcheck_session(conn):
     assert item.fixed["circulation_status"] == "04"
     assert item.get("AH")
 
-    # 29 -> 30: renew.
-    renew = conn.send(sip2.renew(PATRON, ITEM, institution, pin=PIN))
-    assert renew.code == "30", renew
-    assert renew.ok, renew
-
     # 09 -> 10: check the item back in.
     checkin = conn.send(sip2.checkin(ITEM, institution))
     assert checkin.code == "10", checkin
@@ -188,19 +184,22 @@ def test_full_selfcheck_session(conn):
     assert again.code == "10"
     assert not again.ok
 
-    # 35 -> 36.
-    end = conn.send(sip2.end_patron_session(PATRON, institution))
-    assert end.code == "36", end
-    assert end.fixed["end_session"] == "Y"
 
-
-def test_unknown_patron_and_item(conn):
+def test_patron_messages_are_refused_as_unsupported(conn):
     _login(conn)
-    patron = conn.send(sip2.patron_information("NOBODY", "CERN"))
-    assert patron.code == "64"
-    assert patron.get("BL") == "N"
-    assert patron.fixed["patron_status"][0] == "Y"  # charge privileges denied
+    for body, code in [
+        (sip2.patron_information(PATRON, "CERN", pin=PIN), "64"),
+        (sip2.renew(PATRON, ITEM, "CERN"), "30"),
+        (sip2.end_patron_session(PATRON, "CERN"), "36"),
+    ]:
+        response = conn.send(body)
+        assert response.code == code, response
+        assert "not available" in response.get("AF", "").lower()
+        assert not response.get("AE")
 
+
+def test_unknown_item(conn):
+    _login(conn)
     item = conn.send(sip2.item_information("NOTHING", "CERN"))
     assert item.code == "18"
     assert item.fixed["circulation_status"] == "01"  # other
@@ -242,7 +241,8 @@ def test_bad_checksum_gets_96(sip2_server):
 
 def test_resend_after_reconnect_is_idempotent(sip2_server):
     """Same frame on a new connection -> same transaction_id -> ILS replays the result."""
-    body = f"11YN{sip2.now()}{sip2.BLANK_DATE}AOCERN|AA{PATRON}|AB{ITEM}|AC|"
+    # A fixed transaction date, so no other test's checkout can share the id.
+    body = f"11YN20200101    000000{sip2.BLANK_DATE}AOCERN|AA{PATRON}|AB{ITEM}|AC|"
     replies = []
     for _ in range(2):
         with sip2.Sip2Connection("127.0.0.1", sip2_server["port"], timeout=15) as c:
@@ -263,6 +263,7 @@ def test_every_response_carries_a_valid_checksum(conn):
         _login(conn),
         conn.send(sip2.sc_status()),
         conn.send(sip2.item_information(ITEM, "CERN")),
+        conn.send(sip2.item_status_update(ITEM, "shelf-1", "CERN")),
         conn.send(sip2.end_patron_session(PATRON, "CERN")),
     ]
     assert all(r.checksum_ok is True for r in responses), [str(r) for r in responses]

@@ -1,20 +1,33 @@
-"""Unit tests for ``cds_sip2.ils.client`` (ILS mocked with ``httpx.MockTransport``)."""
+"""Unit tests for ``cds_sip2.rest.client`` (ILS mocked with ``httpx.MockTransport``)."""
+
+import logging
+from datetime import date
 
 import httpx
 import pytest
 
-from cds_sip2.ils import (
+from cds_sip2.domain import (
+    Caller,
+    CheckinResult,
+    CheckoutResult,
+    ILSBackend,
+    Item,
+    ItemStatus,
+    MediaType,
+)
+from cds_sip2.errors import (
     ILSAmbiguous,
-    ILSClient,
     ILSConfigError,
     ILSError,
     ILSNotFound,
     ILSRejected,
     ILSUnavailable,
 )
+from cds_sip2.rest import ILSClient
 from tests.conftest import ILS_URL, run
 
-CIRCULATION = {"user_pid": "42", "terminal": "kiosk1", "transaction_id": "tx1"}
+CALLER = Caller(terminal="kiosk1", user_pid="42", transaction_id="tx1")
+CIRCULATION = {"caller": CALLER}
 
 
 @pytest.fixture
@@ -23,7 +36,7 @@ def call(router):
 
     def _call(method, *args, **kwargs):
         async def go():
-            client = ILSClient(
+            client: ILSBackend = ILSClient(
                 ILS_URL + "/", "tok", 0.5, 0.5, transport=httpx.MockTransport(router)
             )
             try:
@@ -45,7 +58,7 @@ def test_sends_bearer_token_and_accept_json(call, router):
 
     item = call("get_item", "IT1")
 
-    assert item["status"] == "available"
+    assert item.status is ItemStatus.AVAILABLE
     sent = router.calls[0]
     assert sent.headers["Authorization"] == "Bearer tok"
     assert sent.headers["Accept"] == "application/json"
@@ -53,15 +66,13 @@ def test_sends_bearer_token_and_accept_json(call, router):
 
 def test_barcode_is_one_path_segment(call, router):
     router.get("/items/A%2FB%3F", json={"barcode": "A/B?"})
-    assert call("get_item", "A/B?")["barcode"] == "A/B?"
+    assert call("get_item", "A/B?").barcode == "A/B?"
 
 
 def test_lookups_return_none_on_404(call, router):
     router.get("/items/NOPE", status=404)
-    router.get("/patrons/NOPE", status=404)
 
     assert call("get_item", "NOPE") is None
-    assert call("get_patron", "NOPE") is None
 
 
 def test_404_on_transaction_raises_not_found(call, router):
@@ -110,25 +121,15 @@ def test_lost_answer_on_circulation_is_ambiguous(call, router, exc):
 
 @pytest.mark.parametrize("status", [500, 502, 504])
 def test_5xx_on_circulation_is_ambiguous(call, router, status):
-    router.post("/renew", status=status)
+    router.post("/items/IT1/status", status=status)
 
     with pytest.raises(ILSAmbiguous):
-        call("renew", item_barcode="IT1", patron_barcode="P001", **CIRCULATION)
+        call("update_item_status", item_barcode="IT1", properties="x", **CIRCULATION)
 
 
 def test_ambiguous_is_not_unavailable():
     """Handlers must be able to tell the two apart with ``except`` order alone."""
     assert not issubclass(ILSAmbiguous, ILSUnavailable)
-
-
-def test_login_and_verify_are_never_ambiguous(call, router):
-    router.post("/login", exc=httpx.ReadTimeout)
-    router.post("/patrons/P1/verify", status=500)
-
-    with pytest.raises(ILSUnavailable):
-        call("login", "kiosk1", "secret")
-    with pytest.raises(ILSUnavailable):
-        call("verify_patron_pin", "P1", "1234")
 
 
 @pytest.mark.parametrize("status", [401, 403])
@@ -203,27 +204,6 @@ def test_checkout_payload_shape(call, router):
     }
 
 
-def test_login_refused_returns_none(call, router):
-    router.post("/login", json={"ok": False})
-    assert call("login", "kiosk1", "bad") is None
-
-
-def test_login_ok_returns_payload(call, router):
-    router.post("/login", json={"ok": True, "user_pid": "42", "location_pid": "1"})
-    assert call("login", "kiosk1", "secret", ip="10.0.0.5")["user_pid"] == "42"
-    assert router.body() == {"terminal": "kiosk1", "password": "secret", "ip": "10.0.0.5"}
-
-
-def test_verify_pin(call, router):
-    router.post("/patrons/P001/verify", json={"ok": True})
-    router.post("/patrons/P002/verify", json={"ok": False})
-    router.post("/patrons/NOPE/verify", status=404)
-
-    assert call("verify_patron_pin", "P001", "1234") is True
-    assert call("verify_patron_pin", "P002", "1234") is False
-    assert call("verify_patron_pin", "NOPE", "1234") is False
-
-
 def test_non_json_success_body_raises(call, router):
     router.get("/items/IT1", content=b"<html>")
 
@@ -238,12 +218,126 @@ def test_non_object_json_raises(call, router):
         call("get_item", "IT1")
 
 
-def test_204_on_a_transaction_is_an_error(call, router):
-    router.post("/checkin", status=204)
-    with pytest.raises(ILSError):
+@pytest.mark.parametrize(
+    "answer", [{"status": 204}, {"content": b"<html>"}, {"json": ["not", "an", "object"]}]
+)
+def test_unreadable_2xx_on_a_write_is_ambiguous(call, router, answer):
+    """The ILS answered 2xx, so it probably acted: the kiosk must not be told "no"."""
+    router.post("/checkin", **answer)
+    with pytest.raises(ILSAmbiguous):
         call("checkin", item_barcode="IT1", **CIRCULATION)
+
+
+def test_empty_body_on_a_lookup_is_an_error(call, router):
+    router.get("/items/IT1", status=200)
+    with pytest.raises(ILSError):
+        call("get_item", "IT1")
 
 
 def test_204_is_fine_for_ping(call, router):
     router.get("/ping", status=204)
     assert call("ping") is True
+
+
+def test_update_item_status_payload_shape(call, router):
+    router.post("/items/A%2FB/status", json={"barcode": "A/B", "title": "T", "status": "other"})
+
+    item = call("update_item_status", item_barcode="A/B", properties="seen", **CIRCULATION)
+
+    assert item.title == "T"
+    assert router.body() == {
+        "item_barcode": "A/B",
+        "properties": "seen",
+        "user_pid": "42",
+        "terminal": "kiosk1",
+        "transaction_id": "tx1",
+    }
+
+
+# ------------------------------------------------------------------ parsing
+
+
+def test_item_is_parsed_once_into_the_domain_type(call, router):
+    router.get(
+        "/items/IT1",
+        json={
+            "barcode": "IT1",
+            "title": "SICP",
+            "status": "on_loan",
+            "location": "Main reading room",
+            "current_location": "",
+            "due_date": "2026-11-04",
+            "hold_queue_length": "2",
+            "owner": "CERN Library",
+            "media_type": "video",
+            "messages": ["Return to desk"],
+        },
+    )
+
+    assert call("get_item", "IT1") == Item(
+        barcode="IT1",
+        title="SICP",
+        status=ItemStatus.ON_LOAN,
+        location="Main reading room",
+        current_location=None,
+        due_date=date(2026, 11, 4),
+        hold_queue_length=2,
+        owner="CERN Library",
+        media_type=MediaType.VIDEO,
+        messages=("Return to desk",),
+    )
+
+
+def test_minimal_item_gets_defaults(call, router):
+    router.get("/items/IT1", json={"status": "available"})
+    assert call("get_item", "IT1") == Item(barcode="IT1", title="", status=ItemStatus.AVAILABLE)
+
+
+def test_unknown_status_becomes_other_with_a_warning(call, router, caplog):
+    router.get("/items/IT1", json={"status": "teleported", "media_type": "hologram"})
+
+    with caplog.at_level(logging.WARNING, logger="cds_sip2.rest.client"):
+        item = call("get_item", "IT1")
+
+    assert item.status is ItemStatus.OTHER
+    assert item.media_type is None  # the SIP2 side falls back to its configured default
+    assert "unknown ILS item status" in caplog.text
+    assert "unknown ILS media type" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("2026-11-04", date(2026, 11, 4)),
+        ("2026-11-04T23:59:00+01:00", date(2026, 11, 4)),
+        ("tomorrow", None),
+        (None, None),
+        ("", None),
+    ],
+)
+def test_due_dates(call, router, value, expected):
+    router.get("/items/IT1", json={"status": "on_loan", "due_date": value})
+    assert call("get_item", "IT1").due_date == expected
+
+
+def test_messages_become_a_tuple(call, router):
+    router.get("/items/IT1", json={"status": "available", "messages": "one"})
+    assert call("get_item", "IT1").messages == ("one",)
+
+
+def test_wrongly_shaped_lookup_body_is_an_ils_error_not_a_crash(call, router):
+    router.get("/items/IT1", json={"status": "available", "messages": 42})
+    with pytest.raises(ILSError):
+        call("get_item", "IT1")
+
+
+def test_checkout_and_checkin_results(call, router):
+    router.post("/checkout", json={"title": "SICP", "due_date": "2026-11-11", "is_renewal": True})
+    router.post("/checkin", json={"title": "SICP", "permanent_location": "Shelf 3", "alert": True})
+
+    assert checkout(call) == CheckoutResult(
+        title="SICP", due_date=date(2026, 11, 11), is_renewal=True
+    )
+    assert call("checkin", item_barcode="IT1", **CIRCULATION) == CheckinResult(
+        title="SICP", permanent_location="Shelf 3", alert=True
+    )

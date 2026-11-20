@@ -1,5 +1,6 @@
-"""Dispatcher: 96/97, login gating, resends, transaction ids, log safety."""
+"""Dispatcher: 96/97, login gating, resends, transaction ids, deadline, log safety."""
 
+import asyncio
 import io
 import logging
 from dataclasses import replace
@@ -7,11 +8,11 @@ from dataclasses import replace
 import pytest
 
 from cds_sip2 import logging as log
-from cds_sip2.ils import ILSAmbiguous
+from cds_sip2.errors import ILSAmbiguous
 from cds_sip2.sip2.dispatcher import RESEND, transaction_id
 from cds_sip2.sip2.session import Session
 from tests import sip2_client
-from tests.conftest import request, run
+from tests.conftest import CHECKOUT_RESULT, request, run
 
 NOW = "20261102    120000"
 BLANK = " " * 18
@@ -110,7 +111,7 @@ def test_login_then_circulation(dispatcher, fake_ils):
     login(dispatcher, session)
     _, response = send(dispatcher, session, CHECKOUT, 1)
     assert response.code == "12" and response.ok
-    assert fake_ils.calls_to("checkout")[0]["user_pid"] == "42"
+    assert fake_ils.calls_to("checkout")[0]["caller"].user_pid == "42"
 
 
 def test_unsupported_message_gets_a_well_formed_refusal(dispatcher, session):
@@ -120,8 +121,7 @@ def test_unsupported_message_gets_a_well_formed_refusal(dispatcher, session):
     assert response.checksum_ok is True
 
 
-def test_repeated_failed_logins_close_the_connection(dispatcher, fake_ils, settings):
-    fake_ils.answers["login"] = None
+def test_repeated_failed_logins_close_the_connection(dispatcher, settings):
     session = Session()
     for attempt in range(1, settings.max_login_attempts + 1):
         outcome, response = send(dispatcher, session, "9300CNkiosk1|COwrong|CP|", attempt)
@@ -136,6 +136,45 @@ def test_handler_crash_becomes_unavailable_refusal(dispatcher, fake_ils, session
     assert response.code == "18"
     assert "unavailable" in response.get("AF").lower()
     assert "handler crashed" in caplog.text
+
+
+def test_crash_during_a_write_is_ambiguous_and_never_replayed(dispatcher, fake_ils, session):
+    fake_ils.answers["checkout"] = RuntimeError("bug after the ILS acted?")
+    _, first = send(dispatcher, session, CHECKOUT, 4)
+    assert "check at the library desk" in first.get("AF").lower()
+
+    fake_ils.answers["checkout"] = CHECKOUT_RESULT
+    _, second = send(dispatcher, session, CHECKOUT, 4)
+    assert second.ok and len(fake_ils.calls_to("checkout")) == 2
+
+
+# --------------------------------------------------------------- deadline
+
+
+@pytest.mark.parametrize(
+    "body, name, message",
+    [
+        (CHECKOUT, "checkout", "could not confirm"),
+        (f"17{NOW}AOCERN|ABIT001|", "get_item", "unavailable"),
+    ],
+)
+def test_deadline_answers_before_the_kiosk_gives_up(
+    handlers, settings, fake_ils, session, caplog, body, name, message
+):
+    from cds_sip2.sip2.dispatcher import Dispatcher
+
+    async def hang(**kwargs):
+        await asyncio.sleep(60)
+
+    fake_ils.answers[name] = hang
+    dispatcher = Dispatcher(handlers, replace(settings, request_deadline=0.05))
+
+    with caplog.at_level(logging.ERROR):
+        _, response = send(dispatcher, session, body, 2)
+
+    assert message in response.get("AF").lower()
+    assert not session.replayable  # a resend must ask the ILS again
+    assert "deadline exceeded" in caplog.text
 
 
 # --------------------------------------------------------------- resends
@@ -155,11 +194,11 @@ def test_resend_after_ambiguous_asks_the_ils_again_with_same_id(dispatcher, fake
     assert not first.ok
     assert "check at the library desk" in first.get("AF").lower()
 
-    fake_ils.answers["checkout"] = {"title": "SICP", "due_date": "2026-11-11"}
+    fake_ils.answers["checkout"] = CHECKOUT_RESULT
     _, second = send(dispatcher, session, CHECKOUT, 4)
 
     assert second.ok
-    ids = [call["transaction_id"] for call in fake_ils.calls_to("checkout")]
+    ids = [call["caller"].transaction_id for call in fake_ils.calls_to("checkout")]
     assert len(ids) == 2 and ids[0] == ids[1]
 
 
@@ -182,7 +221,7 @@ def test_transaction_id_is_stable_across_connections(dispatcher, fake_ils):
         session = Session()
         login(dispatcher, session)
         send(dispatcher, session, CHECKOUT, 5)
-    ids = {call["transaction_id"] for call in fake_ils.calls_to("checkout")}
+    ids = {call["caller"].transaction_id for call in fake_ils.calls_to("checkout")}
     assert len(ids) == 1
     assert len(ids.pop()) == 32
 

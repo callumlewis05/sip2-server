@@ -6,7 +6,7 @@ the OpenShift route through stunnel (``--tls --cafile ...``), or inside the
 integration tests.  It speaks SIP2 v2.00 with error detection (``AY<seq>AZ<checksum>``).
 
     python -m tests.sip2_client --host 127.0.0.1 --port 3004 \
-        --terminal kiosk1 --password secret --patron P001 --pin 1234 --item CM-1234567890
+        --terminal kiosk1 --password secret --patron P001 --item CM-1234567890
 
 Message builders return the *body* only; :class:`Sip2Connection` adds the
 sequence number, checksum and ``\\r`` terminator.
@@ -51,6 +51,7 @@ FIXED_FIELDS: Dict[str, List] = {
     "10": [("ok", 1), ("resensitize", 1), ("magnetic_media", 1), ("alert", 1),
            ("transaction_date", 18)],
     "36": [("end_session", 1), ("transaction_date", 18)],
+    "20": [("item_properties_ok", 1), ("transaction_date", 18)],
     "38": [("payment_accepted", 1), ("transaction_date", 18)],
 }
 
@@ -147,6 +148,12 @@ def renew(patron: str, item: str, institution: str = "", terminal_pwd: str = "",
     if pin is not None:
         body += f"AD{pin}|"
     return body
+
+
+def item_status_update(item: str, properties: str, institution: str = "",
+                       terminal_pwd: str = "") -> str:
+    """19 Item Status Update."""
+    return f"19{now()}AO{institution}|AB{item}|AC{terminal_pwd}|CH{properties}|"
 
 
 def end_patron_session(patron: str, institution: str = "") -> str:
@@ -282,8 +289,9 @@ class Sip2Connection:
 
 def run_session(conn: Sip2Connection, terminal: str, password: str, location: str = "",
                 institution: str = "", patron: Optional[str] = None, pin: Optional[str] = None,
-                item: Optional[str] = None, do_checkin: bool = True, do_renew: bool = False):
-    """93 → 99 → [63 → 17 → 11 → (29) → (09) → 35].
+                item: Optional[str] = None, do_checkin: bool = True,
+                status_update: Optional[str] = None):
+    """93 → 99 → [17 → (19) → 11 → (09)], the messages the server supports.
 
     Returns ``[(step, ok, response)]``.
     """
@@ -308,25 +316,18 @@ def run_session(conn: Sip2Connection, terminal: str, password: str, location: st
                   lambda r: r.code == "98" and r.fixed["online_status"] == "Y")
     institution = institution or status.get("AO", "")
 
-    if patron:
-        step("63 patron information", patron_information(patron, institution, pin=pin),
-             lambda r: r.code == "64" and r.get("BL") == "Y"
-             and (pin is None or r.get("CQ") == "Y"))
     if item:
         step("17 item information", item_information(item, institution),
              lambda r: r.code == "18" and r.get("AB") == item)
+        if status_update is not None:
+            step("19 item status update", item_status_update(item, status_update, institution),
+                 lambda r: r.code == "20" and r.fixed["item_properties_ok"] == "1")
     if patron and item:
         step("11 checkout", checkout(patron, item, institution, pin=pin),
              lambda r: r.code == "12" and r.ok and bool(r.get("AH")))
-        if do_renew:
-            step("29 renew", renew(patron, item, institution, pin=pin),
-                 lambda r: r.code == "30" and r.ok)
         if do_checkin:
             step("09 checkin", checkin(item, institution),
                  lambda r: r.code == "10" and r.ok)
-    if patron:
-        step("35 end patron session", end_patron_session(patron, institution),
-             lambda r: r.code == "36" and r.fixed["end_session"] == "Y")
     return results
 
 
@@ -349,7 +350,8 @@ def main(argv=None) -> int:
     parser.add_argument("--pin", help="patron PIN (AD)")
     parser.add_argument("--item", help="item barcode (AB)")
     parser.add_argument("--no-checkin", action="store_true", help="leave the item checked out")
-    parser.add_argument("--renew", action="store_true", help="also send 29 Renew")
+    parser.add_argument("--status-update", metavar="CH",
+                        help="also send 19 Item Status Update with this CH value")
     parser.add_argument("-q", "--quiet", action="store_true", help="do not print raw frames")
     args = parser.parse_args(argv)
 
@@ -359,7 +361,8 @@ def main(argv=None) -> int:
                         verbose=not args.quiet) as conn:
         results = run_session(conn, args.terminal, args.password, args.location,
                               args.institution, args.patron, args.pin, args.item,
-                              do_checkin=not args.no_checkin, do_renew=args.renew)
+                              do_checkin=not args.no_checkin,
+                              status_update=args.status_update)
     failed = [name for name, ok, _ in results if not ok]
     bad_checksums = [name for name, _, r in results if r.checksum_ok is False]
     if bad_checksums:

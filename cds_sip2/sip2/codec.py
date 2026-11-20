@@ -6,9 +6,13 @@
 * :func:`encode` turns a :class:`Response` into bytes. Every variable field
   is stripped of ``|`` and control characters and length-limited, because
   titles, names and messages come from the ILS.
-* :func:`redact` is the only way a frame may reach a log line. PINs and
-  passwords are masked, patron barcodes pseudonymised, personal details
-  dropped.
+* :func:`redact` is the only way a frame may reach a log line. It works from
+  an allow-list: tags known to carry no personal data are shown, patron
+  barcodes are pseudonymised, and every other tag is masked. A new tag is
+  therefore hidden until someone decides it is safe to log.
+
+:class:`Request` and :class:`Response` are pure wire objects. Typed views of
+them, per message, live in :mod:`cds_sip2.sip2.mapper`.
 """
 
 import re
@@ -21,12 +25,34 @@ from .messages import REQUESTS, RESPONSES
 
 MAX_FIELD_LENGTH = 255
 
-SECRET_TAGS = frozenset({"AD", "CO", "AC"})
-"""Patron PIN, login password, terminal password: never logged in any form."""
-PERSONAL_TAGS = frozenset({"AE", "BD", "BE", "BF"})
-"""Name, address, email, phone: dropped from logs."""
+LOGGABLE_TAGS = frozenset(
+    {
+        "AO",  # institution id
+        "AB",  # item barcode
+        "AJ",  # title
+        "AH",  # due date
+        "AP",  # current location
+        "AQ",  # permanent location
+        "AM",  # library name
+        "AN",  # terminal location
+        "BG",  # owner
+        "BL",  # valid patron Y/N
+        "BX",  # supported messages
+        "CF",  # hold queue length
+        "CK",  # media type
+        "CN",  # terminal (login user id)
+        "CP",  # location code
+        "CQ",  # valid patron password Y/N
+        "AY",  # sequence number
+        "AZ",  # checksum
+    }
+)
+"""Tags shown as-is in logs. Everything else is masked as ``XX~``."""
 PSEUDONYMISED_TAGS = frozenset({"AA"})
 """Patron barcode: logged as a keyed hash."""
+
+UNTRAILED = frozenset({"97"})
+"""Requests that legitimately carry no AY/AZ, even with error detection on."""
 
 _CODE = re.compile(r"^\d\d")
 
@@ -47,8 +73,6 @@ class Request:
     """tag -> tuple of values, in arrival order (tags may repeat)."""
     sequence: int | None = None
     raw: bytes = b""
-    transaction_id: str = ""
-    """Content-derived id for the ILS, set by the dispatcher."""
 
     def get(self, tag, default=""):
         values = self.fields.get(tag)
@@ -69,11 +93,9 @@ class Response:
     fixed: dict
     fields: list
     """``[(tag, value), ...]`` in emission order."""
-    ambiguous: bool = False
-    """The ILS outcome is unknown; an identical resend must ask the ILS again."""
 
 
-def build(code, fixed, ambiguous=False, **fields):
+def build(code, fixed, **fields):
     """Assemble a :class:`Response` in spec order.
 
     ``None`` values are dropped, lists become repeated fields, and every
@@ -97,7 +119,7 @@ def build(code, fixed, ambiguous=False, **fields):
             continue
         for item in value if isinstance(value, (list, tuple)) else (value,):
             ordered.append((tag, item))
-    return Response(code, {name: fixed[name] for name in names}, ordered, ambiguous)
+    return Response(code, {name: fixed[name] for name in names}, ordered)
 
 
 def sanitise(value, max_length=MAX_FIELD_LENGTH):
@@ -114,8 +136,13 @@ def sanitise(value, max_length=MAX_FIELD_LENGTH):
     return "".join(cleaned)[:max_length]
 
 
-def decode(frame, error_detection=True, encoding="utf-8"):
-    """Parse one received frame (no terminator)."""
+def decode(frame, error_detection=True, encoding="utf-8", require_checksum=False):
+    """Parse one received frame (no terminator).
+
+    With ``error_detection``, a wrong checksum asks for a resend. With
+    ``require_checksum`` as well, so does a missing trailer (except on
+    :data:`UNTRAILED` messages).
+    """
     body, sequence, checksum_ok = checksum.split(frame)
     if error_detection and checksum_ok is False:
         raise ResendError("bad checksum")
@@ -126,6 +153,8 @@ def decode(frame, error_detection=True, encoding="utf-8"):
     if not _CODE.match(text):
         raise FrameError("does not start with a message code")
     code = text[:2]
+    if error_detection and require_checksum and checksum_ok is None and code not in UNTRAILED:
+        raise ResendError("missing checksum")
     spec = REQUESTS.get(code)
     if spec is None:
         return Request(code=code, sequence=sequence, raw=frame)
@@ -177,11 +206,11 @@ def redact(frame, encoding="utf-8"):
     rendered = []
     for part in text[2 + spec.fixed_width :].split("|"):
         tag = part[:2]
-        if tag in SECRET_TAGS:
-            part = f"{tag}***"
-        elif tag in PERSONAL_TAGS:
-            part = f"{tag}~"
-        elif tag in PSEUDONYMISED_TAGS and len(part) > 2:
+        if len(part) <= 2 or tag in LOGGABLE_TAGS:
+            pass
+        elif tag in PSEUDONYMISED_TAGS:
             part = f"{tag}{pseudonymise(part[2:])}"
+        else:
+            part = f"{tag}~"
         rendered.append(part)
     return head + "|".join(rendered)

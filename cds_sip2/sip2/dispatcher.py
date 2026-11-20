@@ -12,14 +12,18 @@ One call to :meth:`Dispatcher.dispatch` per received frame:
 4. Before login only ``93`` and ``99`` are routed; anything else gets a
    well-formed refusal. Known-but-unsupported messages get one too.
    Unknown codes get a ``96``.
+5. A routed request is parsed into its typed view, given a
+   :class:`~cds_sip2.domain.Caller` (after login), and handled within
+   ``request_deadline`` seconds. On expiry the kiosk gets a refusal that is
+   never replayed from the cache: for a write, the ILS may still act.
 """
 
+import asyncio
 import hashlib
 import logging
-from dataclasses import replace
 from typing import NamedTuple
 
-from . import codec
+from . import codec, mapper
 from .messages import REPLY_CODE, REQUESTS
 
 logger = logging.getLogger("cds_sip2.sip2.dispatcher")
@@ -29,6 +33,9 @@ RESEND = b"96\r"
 not trustworthy."""
 
 PRE_LOGIN = frozenset({"93", "99"})
+
+WRITES = frozenset({"11", "09", "19"})
+"""Requests that change ILS state: a lost answer to these is ambiguous."""
 
 
 class Outcome(NamedTuple):
@@ -61,6 +68,12 @@ class Dispatcher:
         self.handlers = handlers
         self.settings = settings
 
+    def _decode(self, frame):
+        settings = self.settings
+        return codec.decode(
+            frame, settings.error_detection, settings.encoding, settings.require_checksum
+        )
+
     def _encode(self, response, request):
         return codec.encode(
             response, request.sequence, self.settings.error_detection, self.settings.encoding
@@ -81,7 +94,7 @@ class Dispatcher:
     async def dispatch(self, frame, session):
         self._log("request", frame, session)
         try:
-            request = codec.decode(frame, self.settings.error_detection, self.settings.encoding)
+            request = self._decode(frame)
         except codec.FrameError as exc:
             logger.warning(
                 "not a SIP2 frame, closing connection",
@@ -123,9 +136,9 @@ class Dispatcher:
             )
             return self._reply(RESEND, session)
 
-        response = await self._route(request, session)
-        reply = self._encode(response, request)
-        session.remember(frame, reply, replayable=not response.ambiguous)
+        result = await self._route(request, session)
+        reply = self._encode(result.response, request)
+        session.remember(frame, reply, replayable=result.replayable)
         close = request.code == "93" and session.failed_logins >= self.settings.max_login_attempts
         if close:
             logger.warning(
@@ -153,9 +166,30 @@ class Dispatcher:
                 },
             )
             return handlers.refuse(request, session, "unsupported")
-        request = replace(request, transaction_id=transaction_id(request, session.terminal))
+        txid = transaction_id(request, session.terminal)
+        caller = session.caller(txid) if session.authenticated else None
+        message = mapper.parse(request)
         try:
-            return await route(request, session)
+            async with asyncio.timeout(self.settings.request_deadline) as deadline:
+                return await route(message, session, caller)
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            write = request.code in WRITES
+            logger.error(
+                "request deadline exceeded",
+                extra={
+                    "event": "sip2.deadline",
+                    "code": request.code,
+                    "outcome": "ambiguous" if write else "error",
+                    "terminal": session.terminal,
+                    "transaction_id": txid if write else None,
+                    "deadline": self.settings.request_deadline,
+                },
+            )
+            return handlers.refuse(
+                request, session, "ambiguous" if write else "unavailable", replayable=False
+            )
         except Exception:
             logger.exception(
                 "handler crashed",
@@ -166,7 +200,9 @@ class Dispatcher:
                     "terminal": session.terminal,
                 },
             )
-            return handlers.refuse(request, session, "unavailable")
+            # A crash may come after the ILS acted: never replay it from cache.
+            key = "ambiguous" if request.code in WRITES else "unavailable"
+            return handlers.refuse(request, session, key, replayable=False)
 
     def _reply(self, reply, session, close=False):
         self._log("response", reply, session)

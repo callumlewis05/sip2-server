@@ -11,7 +11,7 @@ from cds_sip2.sip2.dispatcher import Dispatcher
 from cds_sip2.sip2.handlers import Handlers
 from cds_sip2.sip2.server import Sip2Server
 from tests import sip2_client
-from tests.conftest import run
+from tests.conftest import CHECKOUT_RESULT, run
 
 NOW = "20261102    120000"
 CHECKOUT = f"11YN{NOW}{' ' * 18}AOCERN|AAP001|ABIT001|AC|"
@@ -130,7 +130,7 @@ def test_shutdown_lets_in_flight_request_finish(fake_ils, settings):
 
         async def slow_checkout(**kwargs):
             await gate.wait()
-            return {"title": "SICP", "due_date": "2026-11-11"}
+            return CHECKOUT_RESULT
 
         fake_ils.answers["checkout"] = slow_checkout
         busy = await connect(server)

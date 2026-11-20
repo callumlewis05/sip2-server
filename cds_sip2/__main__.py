@@ -1,6 +1,6 @@
 """Composition root: ``python -m cds_sip2``.
 
-The only place where the packages meet: settings are read, the ILS client
+The only place where the packages meet: settings are read, the REST client
 is built and handed to the SIP2 side as an ``ILSBackend``.
 """
 
@@ -12,7 +12,7 @@ import sys
 from . import logging as log
 from .config import ConfigError, Settings
 from .health import HealthServer, ILSProbe
-from .ils import ILSClient
+from .rest import ILSClient
 from .sip2.dispatcher import Dispatcher
 from .sip2.handlers import Handlers
 from .sip2.server import Sip2Server
@@ -56,6 +56,11 @@ def main():
     if not settings.ils_token:
         logger.warning(
             "CDS_SIP2_ILS_TOKEN is empty: every ILS call will be rejected",
+            extra={"event": "config", "alert": True},
+        )
+    if not settings.terminals:
+        logger.warning(
+            "CDS_SIP2_TERMINALS is empty: every 93 login will be refused",
             extra={"event": "config", "alert": True},
         )
     asyncio.run(serve(settings))

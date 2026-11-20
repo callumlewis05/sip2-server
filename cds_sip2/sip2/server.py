@@ -1,7 +1,10 @@
 """asyncio TCP server: one task and one :class:`Session` per connection.
 
-Limits: a maximum connection count, an idle timeout per frame, a maximum
-frame size, and TCP keepalive. Per-IP limits belong at the edge: behind
+Limits: a maximum connection count, an idle timeout while waiting for the
+next frame (long: kiosks idle between patrons), a separate write timeout for
+draining a reply (short: a stuck write should fail fast), a maximum frame
+size, and TCP keepalive. The bound on handling a request is the dispatcher's
+``request_deadline``. Per-IP limits belong at the edge: behind
 stunnel every connection comes from loopback.
 
 Shutdown (SIGTERM): stop accepting, close idle connections at once, give
@@ -140,8 +143,14 @@ class Sip2Server:
                 outcome = await self.dispatcher.dispatch(frame, conn.session)
                 if outcome.reply:
                     conn.writer.write(outcome.reply)
-                    async with asyncio.timeout(settings.idle_timeout):
+                    async with asyncio.timeout(settings.write_timeout):
                         await conn.writer.drain()
+            except TimeoutError:
+                logger.warning(
+                    "write timeout, closing",
+                    extra={"event": "connection.write_timeout", "peer": conn.session.peer},
+                )
+                return
             finally:
                 conn.busy = False
             if outcome.close:

@@ -63,9 +63,18 @@ def test_bad_checksum_asks_for_resend():
     assert decode(tampered, error_detection=False).code == "99"
 
 
-def test_missing_trailer_is_accepted():
+def test_missing_trailer_is_accepted_by_default():
     req = decode(b"9900402.00")
     assert req.code == "99" and req.sequence is None
+
+
+def test_strict_mode_asks_for_resend_when_the_trailer_is_missing():
+    with pytest.raises(ResendError):
+        decode(b"9900402.00", require_checksum=True)
+    assert decode(b"97", require_checksum=True).code == "97"  # 97 has no trailer
+    assert decode(wire("9900402.00"), require_checksum=True).code == "99"
+    # Strict mode only applies with error detection on.
+    assert decode(b"9900402.00", error_detection=False, require_checksum=True).code == "99"
 
 
 def test_truncated_fixed_part_asks_for_resend():
@@ -183,7 +192,15 @@ def test_redact_masks_secrets_and_pseudonymises_patron(body):
     text = redact(wire(body))
     assert "s3cr3t" not in text
     assert "P001" not in text
-    assert "***" in text
+    assert "AAp:" in text or body.startswith("93")
+
+
+def test_redact_masks_tags_not_on_the_allow_list():
+    """A tag nobody has classified (here a patron note in a made-up field) is hidden."""
+    text = redact(wire(f"17{NOW}AOCERN|ABIT1|ZZprivate note|CHseen by Ada|"))
+    assert "private" not in text and "Ada" not in text
+    assert "ZZ~" in text and "CH~" in text
+    assert "AOCERN|ABIT1|" in text
 
 
 def test_redact_drops_personal_details_from_responses():

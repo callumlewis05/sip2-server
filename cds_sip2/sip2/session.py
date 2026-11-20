@@ -8,13 +8,15 @@ this state; see :func:`cds_sip2.sip2.dispatcher.transaction_id`.
 
 from dataclasses import dataclass
 
+from ..domain import Caller
+
 
 @dataclass
 class Session:
     peer: str = ""
     """Address the connection came from (stunnel's, i.e. loopback, in the pod)."""
 
-    # Set by a successful 93 and handed to every circulation call.
+    # Set by a successful 93; terminal and user_pid go into every Caller.
     terminal: str | None = None
     user_pid: str | None = None
     institution_id: str | None = None
@@ -32,6 +34,12 @@ class Session:
     @property
     def authenticated(self):
         return self.user_pid is not None
+
+    def caller(self, transaction_id):
+        """The :class:`~cds_sip2.domain.Caller` for a request on this session."""
+        if not self.authenticated:
+            raise RuntimeError("no Caller before login")
+        return Caller(self.terminal, self.user_pid, transaction_id)
 
     def login(self, terminal, user_pid, institution_id, library_name, language):
         self.terminal = terminal

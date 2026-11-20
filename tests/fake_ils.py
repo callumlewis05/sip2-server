@@ -2,7 +2,10 @@
 
 Used by the integration tests (started in a thread) and by docker-compose for
 local development (``python -m tests.fake_ils --port 5001``).  It implements
-the contract documented in ``cds_sip2/ils_client.py`` and the README.
+the contract documented in ``cds_sip2/rest/client.py`` and the README.
+
+Patrons exist here only so that checkout can be refused for an unknown or
+blocked patron; the SIP2 server has no patron endpoints yet.
 """
 
 import argparse
@@ -16,21 +19,14 @@ from werkzeug.serving import make_server
 TOKEN = "test-token"
 LOAN_DAYS = 28
 
-TERMINALS = {
-    "kiosk1": {"password": "secret", "user_pid": "42", "location_pid": "1",
-               "institution_id": "CERN", "library_name": "CERN Library", "language": "en"},
-}
-
 PATRONS = {
-    "P001": {"name": "Ada Lovelace", "email": "ada@example.org", "pin": "1234",
-             "status_flags": [], "holds": [], "fines_total": "0.00", "currency": "CHF"},
-    "P002": {"name": "Blocked Patron", "email": "blocked@example.org", "pin": "0000",
-             "status_flags": ["charge_privileges_denied", "excessive_outstanding_fines"],
-             "holds": [], "fines_total": "12.50", "currency": "CHF"},
+    "P001": {"name": "Ada Lovelace", "blocks": []},
+    "P002": {"name": "Blocked Patron",
+             "blocks": ["charge_privileges_denied", "excessive_outstanding_fines"]},
 }
 
 ITEMS = {
-    "CM-B000456412": {"title": "Écoute",
+    "CM-B000456412": {"title": "Écoute", "media_type": "book",
                       "status": "available", "location": "Main reading room",
                       "on_loan_to": None, "due_date": None, "hold_queue_length": 0},
     "CM-1234567890": {"title": "MySQL",
@@ -44,7 +40,6 @@ ITEMS = {
 
 def fresh_state():
     state = {
-        "terminals": copy.deepcopy(TERMINALS),
         "patrons": copy.deepcopy(PATRONS),
         "items": copy.deepcopy(ITEMS),
         "transactions": {},
@@ -79,26 +74,13 @@ def _blueprint():
     def today():
         return dt.date.today()
 
-    def patron_view(barcode, patron):
-        items = st()["items"]
-        loans = [b for b, it in items.items() if it["on_loan_to"] == barcode]
-        overdue = [b for b in loans if items[b]["due_date"]
-                   and dt.date.fromisoformat(items[b]["due_date"]) < today()]
-        fines = ["overdue"] if patron["fines_total"] not in ("0", "0.00") else []
-        return {
-            "barcode": barcode, "name": patron["name"], "email": patron["email"],
-            "status_flags": patron["status_flags"],
-            "loans": loans, "overdue": overdue, "holds": patron["holds"],
-            "recalls": [], "unavailable_holds": [], "fines": fines,
-            "fines_total": patron["fines_total"], "currency": patron["currency"],
-        }
-
     def item_view(barcode, item):
         return {
             "barcode": barcode, "title": item["title"], "status": item["status"],
             "location": item["location"], "current_location": None,
             "due_date": item["due_date"], "hold_queue_length": item["hold_queue_length"],
-            "owner": "CERN Library",
+            "owner": "CERN Library", "media_type": item.get("media_type"),
+            "messages": [f"Seen: {item['seen']}"] if item.get("seen") else [],
         }
 
     def replay(txid):
@@ -123,29 +105,6 @@ def _blueprint():
     def ping():
         return jsonify({"ok": True})
 
-    @bp.post("/login")
-    def login():
-        data = request.get_json(force=True, silent=True) or {}
-        terminal = st()["terminals"].get(data.get("terminal"))
-        if not terminal or terminal["password"] != data.get("password"):
-            return jsonify({"ok": False})
-        return jsonify({"ok": True, **{k: v for k, v in terminal.items() if k != "password"}})
-
-    @bp.get("/patrons/<barcode>")
-    def get_patron(barcode):
-        patron = st()["patrons"].get(barcode)
-        if patron is None:
-            reject(404, "patron_not_found", "unknown patron")
-        return jsonify(patron_view(barcode, patron))
-
-    @bp.post("/patrons/<barcode>/verify")
-    def verify_pin(barcode):
-        patron = st()["patrons"].get(barcode)
-        if patron is None:
-            reject(404, "patron_not_found", "unknown patron")
-        data = request.get_json(force=True, silent=True) or {}
-        return jsonify({"ok": data.get("pin") == patron["pin"]})
-
     @bp.get("/items/<barcode>")
     def get_item(barcode):
         item = st()["items"].get(barcode)
@@ -166,7 +125,7 @@ def _blueprint():
         if patron is None:
             reject(409, "patron_not_found", "unknown patron",
                    "Card not recognised.", title=item["title"])
-        if "charge_privileges_denied" in patron["status_flags"]:
+        if "charge_privileges_denied" in patron["blocks"]:
             reject(409, "patron_blocked", "patron is blocked",
                    "Your account is blocked. Please ask at the library desk.", title=item["title"])
         if item["status"] != "available":
@@ -198,24 +157,17 @@ def _blueprint():
             "transaction_id": data.get("transaction_id"),
         })
 
-    @bp.post("/renew")
-    def do_renew():
+    @bp.post("/items/<barcode>/status")
+    def update_item_status(barcode):
         data = request.get_json(force=True, silent=True) or {}
         replayed = replay(data.get("transaction_id"))
         if replayed is not None:
             return replayed
-        item = st()["items"].get(data.get("item_barcode"))
+        item = st()["items"].get(barcode)
         if item is None:
             reject(404, "item_not_found", "unknown item")
-        if item["on_loan_to"] != data.get("patron_barcode"):
-            reject(409, "not_borrower", "item is not on loan to this patron",
-                   "This item is not on loan to you.", title=item["title"])
-        due = (today() + dt.timedelta(days=LOAN_DAYS)).isoformat()
-        item["due_date"] = due
-        return remember(data.get("transaction_id"), {
-            "title": item["title"], "due_date": due,
-            "transaction_id": data.get("transaction_id"),
-        })
+        item["seen"] = data.get("properties") or "yes"
+        return remember(data.get("transaction_id"), item_view(barcode, item))
 
     return bp
 

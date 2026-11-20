@@ -2,7 +2,7 @@
 #
 #   docker compose up --build
 #   python -m tests.sip2_client --port 3004 --terminal kiosk1 --password secret \
-#       --patron P001 --pin 1234 --item CM-B000456412
+#       --patron P001 --item CM-B000456412 --status-update shelf-1
 #
 services:
   fake-ils:
@@ -21,6 +21,7 @@ services:
       CDS_SIP2_BIND_HOST: 0.0.0.0       # only for local use; the pod binds 127.0.0.1
       CDS_SIP2_ILS_URL: http://fake-ils:5001/api/sip2
       CDS_SIP2_ILS_TOKEN: test-token
+      CDS_SIP2_TERMINALS: '{"kiosk1": {"password": "secret", "user_pid": "42"}}'
       CDS_SIP2_LOG_HASH_KEY: dev
     ports: ["3004:3004", "8080:8080"]
     healthcheck:

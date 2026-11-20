@@ -1,13 +1,13 @@
-"""Errors raised by an :class:`~cds_sip2.ils.interface.ILSBackend`.
+"""Errors raised by an :class:`~cds_sip2.domain.ILSBackend`.
 
 =====================  ==========================================================
 Exception              Meaning
 =====================  ==========================================================
-``ILSNotFound``        404 on a circulation call: the ILS does not know the item.
+``ILSNotFound``        404 on a write: the ILS does not know the item.
 ``ILSRejected``        The ILS declined (409 / other 4xx, or ``{"ok": false}``).
 ``ILSUnavailable``     Nothing was processed: connect failure, or 5xx / timeout on
                        a lookup.
-``ILSAmbiguous``       A circulation POST was sent but no answer came back. The
+``ILSAmbiguous``       A write was sent but no usable answer came back. The
                        ILS may or may not have recorded it.
 ``ILSConfigError``     The ILS rejected our service token (401/403).
 =====================  ==========================================================
@@ -27,10 +27,11 @@ class ILSUnavailable(ILSError):
 class ILSAmbiguous(ILSError):
     """A circulation request may or may not have been processed.
 
-    Raised only for checkout, checkin and renew, when the request left this
-    process but no response arrived (read timeout, connection reset, 5xx from
-    a proxy in front of the ILS). Never raised by lookups or by a connect
-    failure, where nothing was sent.
+    Raised only for writes (checkout, checkin, item status update), when the
+    request left this process but no usable response arrived (read timeout,
+    connection reset, 5xx from a proxy in front of the ILS, or a 2xx body that
+    cannot be read). Never raised by lookups or by a connect failure, where
+    nothing was sent.
     """
 
     def __init__(self, message, transaction_id=None):
@@ -43,7 +44,7 @@ class ILSConfigError(ILSError):
 
 
 class ILSNotFound(ILSError):
-    """404 on a circulation call: the item is unknown to the ILS."""
+    """404 on a write: the item is unknown to the ILS."""
 
 
 class ILSRejected(ILSError):

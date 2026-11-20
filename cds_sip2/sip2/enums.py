@@ -1,6 +1,15 @@
-"""SIP2 2.00 code tables, and the ILS vocabulary that maps onto them."""
+"""SIP2 2.00 code tables, and the maps from the domain vocabulary onto them.
+
+The ILS vocabulary itself lives in :mod:`cds_sip2.domain`. The maps here are
+explicit, so reordering or extending a domain enum can never shift a SIP2
+code or a position in the patron status field.
+"""
 
 from enum import StrEnum
+
+from ..domain import ItemStatus
+from ..domain import MediaType as DomainMediaType
+from ..domain import PatronBlock
 
 
 class CirculationStatus(StrEnum):
@@ -27,6 +36,8 @@ class SecurityMarker(StrEnum):
 
 
 class FeeType(StrEnum):
+    """Only ``OTHER`` is sent today (the 18's fixed part requires a fee type)."""
+
     OTHER = "01"
     ADMINISTRATIVE = "02"
     DAMAGE = "03"
@@ -52,55 +63,69 @@ class MediaType(StrEnum):
     BOOK_WITH_AUDIO_TAPE = "010"
 
 
-PATRON_STATUS_FLAGS = (
-    "charge_privileges_denied",
-    "renewal_privileges_denied",
-    "recall_privileges_denied",
-    "hold_privileges_denied",
-    "card_reported_lost",
-    "too_many_items_charged",
-    "too_many_items_overdue",
-    "too_many_renewals",
-    "too_many_claims_of_items_returned",
-    "too_many_items_lost",
-    "excessive_outstanding_fines",
-    "excessive_outstanding_fees",
-    "recall_overdue",
-    "too_many_items_billed",
-)
-"""ILS ``status_flags`` vocabulary, in the order of the 14-char patron status
-field. The names match invenio-sip2's ``PatronStatusTypes`` values, so the
-ILS contract is unchanged."""
-
-DENIED_FLAGS = (
-    "charge_privileges_denied",
-    "renewal_privileges_denied",
-    "hold_privileges_denied",
-)
-"""Flags set on a patron we cannot vouch for (unknown, or ILS down)."""
-
-
-def patron_status(flags):
-    """``(14-char field, [unknown flags])`` for a list of ILS status flags."""
-    flags = set(flags or ())
-    unknown = sorted(str(flag) for flag in flags - set(PATRON_STATUS_FLAGS))
-    field = "".join("Y" if name in flags else " " for name in PATRON_STATUS_FLAGS)
-    return field, unknown
-
-
-ITEM_STATUS = {
-    "available": CirculationStatus.AVAILABLE,
-    "on_loan": CirculationStatus.CHARGED,
-    "recalled": CirculationStatus.RECALLED,
-    "on_hold_shelf": CirculationStatus.WAITING_ON_HOLD_SHELF,
-    "in_transit": CirculationStatus.IN_TRANSIT,
-    "in_process": CirculationStatus.IN_PROCESS,
-    "on_order": CirculationStatus.ON_ORDER,
-    "lost": CirculationStatus.LOST,
-    "missing": CirculationStatus.MISSING,
-    "other": CirculationStatus.OTHER,
+CIRCULATION_STATUS = {
+    ItemStatus.AVAILABLE: CirculationStatus.AVAILABLE,
+    ItemStatus.ON_LOAN: CirculationStatus.CHARGED,
+    ItemStatus.RECALLED: CirculationStatus.RECALLED,
+    ItemStatus.ON_HOLD_SHELF: CirculationStatus.WAITING_ON_HOLD_SHELF,
+    ItemStatus.IN_TRANSIT: CirculationStatus.IN_TRANSIT,
+    ItemStatus.IN_PROCESS: CirculationStatus.IN_PROCESS,
+    ItemStatus.ON_ORDER: CirculationStatus.ON_ORDER,
+    ItemStatus.LOST: CirculationStatus.LOST,
+    ItemStatus.MISSING: CirculationStatus.MISSING,
+    ItemStatus.OTHER: CirculationStatus.OTHER,
 }
-"""ILS item status vocabulary (see ILSClient.get_item) -> SIP2 circulation status."""
+"""Every :class:`ItemStatus` -> its SIP2 circulation status (tested to be total)."""
+
+MEDIA_TYPE = {
+    DomainMediaType.BOOK: MediaType.BOOK,
+    DomainMediaType.MAGAZINE: MediaType.MAGAZINE,
+    DomainMediaType.BOUND_JOURNAL: MediaType.BOUND_JOURNAL,
+    DomainMediaType.AUDIO: MediaType.AUDIO_TAPE,
+    DomainMediaType.VIDEO: MediaType.VIDEO_TAPE,
+    DomainMediaType.CD: MediaType.CD_OR_CDROM,
+    DomainMediaType.DISKETTE: MediaType.DISKETTE,
+    DomainMediaType.BOOK_WITH_CD: MediaType.BOOK_WITH_CD,
+    DomainMediaType.BOOK_WITH_DISKETTE: MediaType.BOOK_WITH_DISKETTE,
+    DomainMediaType.BOOK_WITH_AUDIO: MediaType.BOOK_WITH_AUDIO_TAPE,
+    DomainMediaType.OTHER: MediaType.OTHER,
+}
+"""Every domain media type -> SIP2 ``CK`` code (tested to be total)."""
+
+PATRON_STATUS_POSITIONS = (
+    PatronBlock.CHARGE_PRIVILEGES_DENIED,
+    PatronBlock.RENEWAL_PRIVILEGES_DENIED,
+    PatronBlock.RECALL_PRIVILEGES_DENIED,
+    PatronBlock.HOLD_PRIVILEGES_DENIED,
+    PatronBlock.CARD_REPORTED_LOST,
+    PatronBlock.TOO_MANY_ITEMS_CHARGED,
+    PatronBlock.TOO_MANY_ITEMS_OVERDUE,
+    PatronBlock.TOO_MANY_RENEWALS,
+    PatronBlock.TOO_MANY_CLAIMS_OF_ITEMS_RETURNED,
+    PatronBlock.TOO_MANY_ITEMS_LOST,
+    PatronBlock.EXCESSIVE_OUTSTANDING_FINES,
+    PatronBlock.EXCESSIVE_OUTSTANDING_FEES,
+    PatronBlock.RECALL_OVERDUE,
+    PatronBlock.TOO_MANY_ITEMS_BILLED,
+)
+"""Position of each block in the 14-char SIP2 patron status field."""
+
+
+def patron_status(blocks):
+    """14-char patron status field for a set of :class:`PatronBlock`."""
+    blocks = set(blocks or ())
+    return "".join("Y" if block in blocks else " " for block in PATRON_STATUS_POSITIONS)
+
+
+DENIED_STATUS = patron_status(
+    {
+        PatronBlock.CHARGE_PRIVILEGES_DENIED,
+        PatronBlock.RENEWAL_PRIVILEGES_DENIED,
+        PatronBlock.HOLD_PRIVILEGES_DENIED,
+    }
+)
+"""Patron status sent in every patron-message refusal: we cannot vouch for
+the patron, and patron messages are not supported yet."""
 
 LANGUAGES = {
     "en": "001",

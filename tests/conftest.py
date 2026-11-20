@@ -1,9 +1,9 @@
 """Shared fixtures.
 
-* ``fake_ils``: an in-memory :class:`~cds_sip2.ils.interface.ILSBackend`
+* ``fake_ils``: an in-memory :class:`~cds_sip2.domain.ILSBackend`
   for the SIP2-side tests (handlers, dispatcher, server). It speaks Python,
   not HTTP, exactly like the seam between the packages.
-* ``router``: an ``httpx.MockTransport`` handler for the ILS client tests.
+* ``router``: an ``httpx.MockTransport`` handler for the REST client tests.
 
 Async code is driven with ``asyncio.run`` so no pytest plugin is needed.
 """
@@ -11,11 +11,13 @@ Async code is driven with ``asyncio.run`` so no pytest plugin is needed.
 import asyncio
 import inspect
 import json as jsonlib
+from datetime import date
 
 import httpx
 import pytest
 
 from cds_sip2.config import Settings
+from cds_sip2.domain import CheckinResult, CheckoutResult, ILSBackend, Item, ItemStatus
 from cds_sip2.sip2.codec import decode
 from cds_sip2.sip2.dispatcher import Dispatcher
 from cds_sip2.sip2.handlers import Handlers
@@ -28,58 +30,35 @@ def run(coro):
     return asyncio.run(coro)
 
 
-PATRON = {
-    "barcode": "P001",
-    "name": "Ada Lovelace",
-    "email": "ada@example.org",
-    "status_flags": [],
-    "loans": ["IT002", "IT005"],
-    "overdue": ["IT005"],
-    "holds": ["IT009"],
-    "recalls": [],
-    "unavailable_holds": [],
-    "fines": [],
-    "fines_total": "0.00",
-    "currency": "CHF",
-}
-ITEM = {
-    "barcode": "IT001",
-    "title": "SICP",
-    "status": "available",
-    "location": "Main reading room",
-    "current_location": None,
-    "due_date": None,
-    "hold_queue_length": 2,
-    "owner": "CERN Library",
-}
-LOGIN = {
-    "ok": True,
-    "user_pid": "42",
-    "location_pid": "1",
-    "institution_id": "CERN",
-    "library_name": "CERN Library",
-    "language": "en",
-}
+ITEM = Item(
+    barcode="IT001",
+    title="SICP",
+    status=ItemStatus.AVAILABLE,
+    location="Main reading room",
+    hold_queue_length=2,
+    owner="CERN Library",
+)
+CHECKOUT_RESULT = CheckoutResult(title="SICP", due_date=date(2026, 11, 11))
+CHECKIN_RESULT = CheckinResult(title="SICP", permanent_location="Main reading room")
+TERMINALS = {"kiosk1": {"password": "secret", "user_pid": "42"}}
 
 
 class FakeILS:
-    """Records every call; answers from ``self.answers[name]``.
+    """In-memory :class:`~cds_sip2.domain.ILSBackend`.
 
-    An answer may be a value, an exception (raised), or a callable taking
-    the call's keyword arguments.
+    Records every call; answers from ``self.answers[name]``. An answer may
+    be a value, an exception (raised), or a callable taking the call's
+    keyword arguments.
     """
 
     def __init__(self):
         self.calls = []
         self.answers = {
             "ping": True,
-            "login": LOGIN,
-            "get_patron": PATRON,
-            "verify_patron_pin": True,
             "get_item": ITEM,
-            "checkout": {"title": "SICP", "due_date": "2026-11-11", "is_renewal": False},
-            "checkin": {"title": "SICP", "permanent_location": "Main reading room", "alert": False},
-            "renew": {"title": "SICP", "due_date": "2026-12-01"},
+            "checkout": CHECKOUT_RESULT,
+            "checkin": CHECKIN_RESULT,
+            "update_item_status": ITEM,
         }
 
     def calls_to(self, name):
@@ -101,26 +80,21 @@ class FakeILS:
     async def ping(self):
         return await self._answer("ping")
 
-    async def login(self, terminal, password, ip=None):
-        return await self._answer("login", terminal=terminal, password=password, ip=ip)
-
-    async def get_patron(self, barcode):
-        return await self._answer("get_patron", barcode=barcode)
-
-    async def verify_patron_pin(self, barcode, pin):
-        return await self._answer("verify_patron_pin", barcode=barcode, pin=pin)
-
     async def get_item(self, barcode):
         return await self._answer("get_item", barcode=barcode)
 
-    async def checkout(self, **kwargs):
-        return await self._answer("checkout", **kwargs)
+    async def checkout(self, *, item_barcode, patron_barcode, caller):
+        return await self._answer(
+            "checkout", item_barcode=item_barcode, patron_barcode=patron_barcode, caller=caller
+        )
 
-    async def checkin(self, **kwargs):
-        return await self._answer("checkin", **kwargs)
+    async def checkin(self, *, item_barcode, caller):
+        return await self._answer("checkin", item_barcode=item_barcode, caller=caller)
 
-    async def renew(self, **kwargs):
-        return await self._answer("renew", **kwargs)
+    async def update_item_status(self, *, item_barcode, properties, caller):
+        return await self._answer(
+            "update_item_status", item_barcode=item_barcode, properties=properties, caller=caller
+        )
 
     async def aclose(self):
         pass
@@ -128,12 +102,20 @@ class FakeILS:
 
 @pytest.fixture
 def settings():
-    return Settings(ils_url=ILS_URL, ils_token="t", port=0, health_port=0, log_hash_key="test-key")
+    return Settings(
+        ils_url=ILS_URL,
+        ils_token="t",
+        port=0,
+        health_port=0,
+        log_hash_key="test-key",
+        terminals=TERMINALS,
+    )
 
 
 @pytest.fixture
 def fake_ils():
-    return FakeILS()
+    backend: ILSBackend = FakeILS()  # checked by a type checker, if one runs
+    return backend
 
 
 @pytest.fixture
